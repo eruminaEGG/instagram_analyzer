@@ -1,0 +1,4 @@
+[
+  {"data": [{"id": "photo", "media_type": "IMAGE", "media_product_type": "FEED", "timestamp": "2026-08-10T12:10:00+0000"}, {"id": "reel-1", "media_type": "VIDEO", "media_product_type": "REELS", "timestamp": "2026-08-10T12:10:00+0000"}]},
+  {"data": [{"id": "reel-2", "media_type": "VIDEO", "media_product_type": "REELS", "timestamp": "2026-08-11T12:10:00+0000"}]}
+]

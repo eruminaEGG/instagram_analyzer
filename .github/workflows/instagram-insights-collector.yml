@@ -1,0 +1,81 @@
+name: Instagram Insights Collector infrastructure
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  PROJECT_DIR: .
+
+jobs:
+  validate:
+    name: Validate SAM template and committed secrets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/setup-sam@v2
+      - name: Validate the SAM template
+        run: sam validate --lint --template-file "$PROJECT_DIR/infra/template.yaml"
+      - name: Scan committed content for credentials
+        uses: gitleaks/gitleaks-action@v2
+
+  deploy:
+    name: Deploy through the protected GitHub environment
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_TO_ASSUME: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+      INSTAGRAM_ACCOUNT_ID: ${{ vars.INSTAGRAM_ACCOUNT_ID }}
+      INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+      STACK_NAME: instagram-insights-production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/setup-sam@v2
+      - name: Require deployment configuration without printing secret values
+        shell: bash
+        run: |
+          set +x
+          for name in AWS_REGION AWS_ROLE_TO_ASSUME INSTAGRAM_ACCOUNT_ID INSTAGRAM_ACCESS_TOKEN; do
+            test -n "${!name}" || { echo "Missing GitHub Environment configuration: $name"; exit 1; }
+          done
+      - name: Assume the existing deploy role through OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: instagram-insights-github-deploy
+      - name: Build and deploy the minimal stack
+        shell: bash
+        run: |
+          set +x
+          test -d "$PROJECT_DIR/backend/src" || { echo 'Backend Lambda source is not present; deployment is intentionally blocked.'; exit 1; }
+          sam build --template-file "$PROJECT_DIR/infra/template.yaml" --build-dir "$PROJECT_DIR/.aws-sam/build"
+          sam deploy \
+            --template-file "$PROJECT_DIR/.aws-sam/build/template.yaml" \
+            --stack-name "$STACK_NAME" \
+            --resolve-s3 \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides "ProjectName=instagram-insights Environment=production InstagramAccountId=$INSTAGRAM_ACCOUNT_ID InstagramAccessToken=$INSTAGRAM_ACCESS_TOKEN" \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset
+      - name: Run non-mutating post-deploy checks
+        shell: bash
+        run: |
+          set +x
+          FUNCTION_NAME=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='CollectorFunctionName'].OutputValue" --output text)
+          SCHEDULE_NAME=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='ScheduleName'].OutputValue" --output text)
+          test -n "$FUNCTION_NAME" && test -n "$SCHEDULE_NAME"
+          aws lambda invoke --function-name "$FUNCTION_NAME" --invocation-type DryRun /dev/null >/dev/null
+          test "$(aws scheduler get-schedule --name "$SCHEDULE_NAME" --group-name default --query 'State' --output text)" = ENABLED

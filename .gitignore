@@ -1,0 +1,24 @@
+# SAM build artifacts
+.aws-sam/
+
+# Python environments, caches, and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+
+# Local configuration that can contain credentials
+.env
+.env.*
+!.env.example
+samconfig.toml
+samconfig.local.toml
+
+# Operating-system files
+.DS_Store
