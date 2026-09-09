@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any, Callable
 
 from .errors import CollectionFailedError, CollectorError
-from .observability import JsonLogger
+from .observability import JsonLogger, safe_api_error_code
 from .repository import Repository, is_reel, observation_item
 from .timebox import is_collectable, iso, parse_utc, slot_start
 
@@ -85,6 +85,7 @@ class CollectorService:
                     slot_start=iso(slot),
                     media_id=media["id"],
                     error_class=exc.error_class,
+                    api_error_code=safe_api_error_code(exc.api_error_code),
                 )
 
         summary: dict[str, int | str] = {"slot_start": iso(slot), **counts}

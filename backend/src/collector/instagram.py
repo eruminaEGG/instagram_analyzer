@@ -60,7 +60,10 @@ class InstagramClient:
                 payload = self._error_payload(exc)
                 # Meta commonly signals an expired/invalid token as HTTP 401 or error code 190.
                 if exc.code == 401 or str(payload.get("code")) == "190":
-                    raise AuthExpiredError("Instagram authentication failed") from exc
+                    raise AuthExpiredError(
+                        "Instagram authentication failed",
+                        str(payload.get("code", exc.code)),
+                    ) from exc
                 if exc.code == 429:
                     retry_after = exc.headers.get("Retry-After")
                     try:
@@ -70,7 +73,10 @@ class InstagramClient:
                     if delay is not None and 0 < delay <= 15 and attempt < self._max_retries:
                         self._sleep(delay)
                         continue
-                    raise RateLimitedError("Instagram API rate limited") from exc
+                    raise RateLimitedError(
+                        "Instagram API rate limited",
+                        str(payload.get("code", exc.code)),
+                    ) from exc
                 if 500 <= exc.code < 600 and attempt < self._max_retries:
                     self._sleep((2**attempt) + random.random())
                     continue

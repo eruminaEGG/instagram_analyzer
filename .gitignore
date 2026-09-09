@@ -1,5 +1,7 @@
-# SAM build artifacts
+# Generated deployment artifacts
 .aws-sam/
+.serverless/
+node_modules/
 
 # Python environments, caches, and test output
 __pycache__/

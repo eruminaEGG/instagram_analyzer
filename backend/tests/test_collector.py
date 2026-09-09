@@ -1,7 +1,8 @@
 import json
+import logging
 import unittest
 from datetime import UTC, datetime
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from urllib.error import HTTPError
 
@@ -12,7 +13,7 @@ from collector.errors import (
     RateLimitedError,
 )
 from collector.instagram import InstagramClient
-from collector.observability import JsonLogger, redact
+from collector.observability import JsonLogger, redact, safe_api_error_code
 from collector.repository import DynamoRepository, observation_item
 from collector.service import CollectorService
 from collector.timebox import iso
@@ -164,8 +165,9 @@ class CollectorTests(unittest.TestCase):
                 request.full_url, 429, "rate limited", {"Retry-After": "16"}, BytesIO()
             )
 
-        with self.assertRaises(RateLimitedError):
+        with self.assertRaises(RateLimitedError) as caught:
             InstagramClient("secret", opener=opener, sleep=lambda _: None).insights("m1", ["views"])
+        self.assertEqual(caught.exception.api_error_code, "429")
 
     def test_retry_exhaustion_is_rate_limited(self):
         def opener(request, timeout):
@@ -249,7 +251,7 @@ class CollectorTests(unittest.TestCase):
         logger = CapturingLogger()
         client = FakeClient(
             [{"data": [reel("m1")]}],
-            failures={"m1": AuthExpiredError("access_token=super-secret")},
+            failures={"m1": MediaApiError("access_token=super-secret", "190")},
         )
 
         with self.assertRaises(CollectionFailedError):
@@ -257,8 +259,61 @@ class CollectorTests(unittest.TestCase):
 
         messages = " ".join(logger.messages)
         self.assertNotIn("super-secret", messages)
-        self.assertIn("AUTH_EXPIRED", messages)
+        failed_media = next(
+            json.loads(message)
+            for message in logger.messages
+            if json.loads(message)["event"] == "media_collection_failed"
+        )
+        failed_collection = next(
+            json.loads(message)
+            for message in logger.messages
+            if json.loads(message)["event"] == "collection_failed"
+        )
+        self.assertEqual(
+            failed_media,
+            {
+                "api_error_code": "190",
+                "error_class": "MEDIA_API",
+                "event": "media_collection_failed",
+                "media_id": "m1",
+                "slot_start": SLOT,
+            },
+        )
+        self.assertEqual(failed_collection["error_classes"], {"MEDIA_API": 1})
+        self.assertEqual(failed_collection["failed"], 1)
         self.assertEqual(redact({"access_token": "x", "url": "https://x/?token=y"}), {"access_token": "[REDACTED]", "url": "https://x/?[REDACTED]"})
+
+    def test_default_json_logger_enables_info_and_writes_json(self):
+        logger = logging.getLogger("instagram_insights_collector")
+        previous_level = logger.level
+        previous_handlers = logger.handlers[:]
+        previous_propagate = logger.propagate
+        stream = StringIO()
+        try:
+            logger.handlers = [logging.StreamHandler(stream)]
+            logger.propagate = False
+            logger.setLevel(logging.WARNING)
+
+            JsonLogger().emit("collection_started", slot_start=SLOT)
+
+            self.assertEqual(logger.getEffectiveLevel(), logging.INFO)
+            self.assertEqual(
+                json.loads(stream.getvalue()),
+                {"event": "collection_started", "slot_start": SLOT},
+            )
+        finally:
+            logger.setLevel(previous_level)
+            logger.handlers = previous_handlers
+            logger.propagate = previous_propagate
+
+    def test_api_error_code_accepts_only_bounded_numeric_identifier(self):
+        self.assertEqual(safe_api_error_code(190), "190")
+        self.assertEqual(redact({"api_error_code": "429"}), {"api_error_code": "429"})
+        self.assertIsNone(safe_api_error_code("190 token=super-secret"))
+        self.assertEqual(
+            redact({"api_error_code": "190 token=super-secret"}),
+            {"api_error_code": None},
+        )
 
     def test_dynamo_mapper_uses_only_observation_key_and_conditional_put(self):
         table = CapturingTable()

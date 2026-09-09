@@ -1,0 +1,11 @@
+{
+  "name": "instagram-insights-collector",
+  "private": true,
+  "scripts": {
+    "package": "serverless package --stage production",
+    "deploy": "./deploy.sh -s production"
+  },
+  "devDependencies": {
+    "serverless": "3.40.0"
+  }
+}

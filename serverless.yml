@@ -1,0 +1,139 @@
+service: instagram-insights
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: python3.12
+  architecture: arm64
+  region: ${opt:region, env:AWS_REGION, 'ap-northeast-1'}
+  stage: ${opt:stage, 'production'}
+  memorySize: 256
+  timeout: 900
+  environment:
+    DYNAMODB_TABLE_NAME:
+      Ref: InsightsTable
+    INSTAGRAM_ACCOUNT_ID: ${env:INSTAGRAM_ACCOUNT_ID}
+    INSTAGRAM_ACCESS_TOKEN: ${env:INSTAGRAM_ACCESS_TOKEN}
+    API_VERSION: v26.0
+    INSIGHT_METRICS: plays,reach,likes,comments,shares,saves,total_interactions,profile_visits,follows
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+          Resource:
+            Fn::GetAtt:
+              - InsightsTable
+              - Arn
+
+custom:
+  prefix: ${self:service}-${self:provider.stage}
+  # The SAM stack already owns "-collector" under a different logical ID.
+  # Keep this name stable so CloudFormation can create the Serverless function
+  # before switching the existing Scheduler target and removing the SAM one.
+  collectorFunctionName: ${self:custom.prefix}-collector-v2
+
+package:
+  patterns:
+    - '!**'
+    - backend/src/collector/**
+    - '!**/__pycache__/**'
+    - '!**/*.py[cod]'
+
+functions:
+  collector:
+    name: ${self:custom.collectorFunctionName}
+    description: Scheduled Instagram Insights collection
+    handler: backend.src.collector.handler.lambda_handler
+
+resources:
+  Resources:
+    CollectorLogGroup:
+      Type: AWS::Logs::LogGroup
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+      Properties:
+        LogGroupName: /aws/lambda/${self:custom.collectorFunctionName}
+        RetentionInDays: 30
+
+    InsightsTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+      Properties:
+        TableName: ${self:custom.prefix}-observations
+        BillingMode: PROVISIONED
+        ProvisionedThroughput:
+          ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+
+    SchedulerInvokeRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:custom.prefix}-scheduler
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: scheduler.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: invoke-collector
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: lambda:InvokeFunction
+                  Resource:
+                    Fn::GetAtt:
+                      - CollectorLambdaFunction
+                      - Arn
+
+    HourlySchedule:
+      Type: AWS::Scheduler::Schedule
+      Properties:
+        Name: ${self:custom.prefix}-hourly
+        Description: Runs the collector at minute zero of every UTC hour
+        GroupName: default
+        ScheduleExpression: cron(0 * * * ? *)
+        ScheduleExpressionTimezone: UTC
+        FlexibleTimeWindow:
+          Mode: 'OFF'
+        State: ENABLED
+        Target:
+          Arn:
+            Fn::GetAtt:
+              - CollectorLambdaFunction
+              - Arn
+          RoleArn:
+            Fn::GetAtt:
+              - SchedulerInvokeRole
+              - Arn
+          Input: '{"scheduled_time":"<aws.scheduler.scheduled-time>","trigger":"eventbridge-scheduler"}'
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 60
+            MaximumRetryAttempts: 0
+
+  Outputs:
+    CollectorFunctionName:
+      Value:
+        Ref: CollectorLambdaFunction
+    ScheduleName:
+      Value:
+        Ref: HourlySchedule
+    InsightsTableName:
+      Value:
+        Ref: InsightsTable
