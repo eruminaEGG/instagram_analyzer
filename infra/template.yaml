@@ -101,7 +101,6 @@ Resources:
       CodeUri: ../backend/src/
       Handler: collector.handler.lambda_handler
       Role: !GetAtt CollectorExecutionRole.Arn
-      ReservedConcurrentExecutions: 1
 
   SchedulerInvokeRole:
     Type: AWS::IAM::Role
