@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 from typing import Any, Callable
 
-from .errors import CollectionFailedError, CollectorError
+from .errors import CollectionFailedError, CollectorError, MediaApiError
 from .observability import (
     JsonLogger,
     safe_api_error_code,
@@ -11,7 +11,7 @@ from .observability import (
     safe_api_error_type,
     safe_api_fbtrace_id,
 )
-from .repository import Repository, is_reel, observation_item
+from .repository import Repository, is_reel, observation_item, post_index_item
 from .timebox import is_collectable, iso, parse_utc, slot_start
 
 
@@ -55,6 +55,9 @@ class CollectorService:
             counts["media_seen"] += 1
             if not is_reel(media):
                 continue
+            # Index all discovered Reels, including those beyond the observation
+            # window, so the later final-review workflow can identify due posts.
+            self.repository.upsert_post_index(post_index_item(media, self.account_id))
             if not is_collectable(parse_utc(media["timestamp"]), slot):
                 counts["skipped_30_days"] += 1
                 continue
@@ -67,6 +70,15 @@ class CollectorService:
                 values, missing_metrics, _ = self.client.insights(
                     media["id"], self.insight_metrics
                 )
+                # ``follows`` is API/media-type dependent.  Request it separately
+                # so an unsupported metric cannot discard the established insight
+                # set. Auth, rate-limit, and transport failures remain failures.
+                try:
+                    follows, follows_missing, _ = self.client.insights(media["id"], ["follows"])
+                except MediaApiError:
+                    follows, follows_missing = {}, ["follows"]
+                values.update(follows)
+                missing_metrics = list(dict.fromkeys([*missing_metrics, *follows_missing]))
                 item = observation_item(
                     media=media,
                     account_id=self.account_id,

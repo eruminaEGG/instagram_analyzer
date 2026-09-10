@@ -19,7 +19,12 @@ from collector.observability import (
     safe_api_error_code,
     safe_api_error_message,
 )
-from collector.repository import DynamoRepository, observation_item
+from collector.repository import (
+    DynamoRepository,
+    final_analysis_item,
+    observation_item,
+    post_index_item,
+)
 from collector.service import CollectorService
 from collector.timebox import iso
 
@@ -28,19 +33,20 @@ SLOT_EVENT = {"scheduled_time": "2026-09-07T12:34:56Z"}
 SLOT = "2026-09-07T12:00:00Z"
 
 
-def reel(media_id: str, timestamp: str = "2026-09-01T12:00:00Z") -> dict:
+def reel(media_id: str, timestamp: str = "2026-09-01T12:00:00Z", **extra) -> dict:
     return {
         "id": media_id,
         "media_type": "VIDEO",
         "media_product_type": "REELS",
         "timestamp": timestamp,
-    }
+    } | extra
 
 
 class FakeClient:
-    def __init__(self, pages, answers=None, failures=None):
+    def __init__(self, pages, answers=None, follows_answers=None, failures=None):
         self.pages = pages
         self.answers = answers or {}
+        self.follows_answers = follows_answers or {}
         self.failures = failures or {}
         self.insight_calls = []
 
@@ -49,9 +55,11 @@ class FakeClient:
             yield from page["data"]
 
     def insights(self, media_id, requested_metrics):
-        self.insight_calls.append(media_id)
+        self.insight_calls.append((media_id, requested_metrics))
         if media_id in self.failures:
             raise self.failures[media_id]
+        if requested_metrics == ["follows"]:
+            return self.follows_answers.get(media_id, ({}, ["follows"], "trace-ignored"))
         return self.answers.get(media_id, ({"views": 10}, [], "trace-ignored"))
 
 
@@ -59,6 +67,7 @@ class MemoryRepository:
     def __init__(self):
         self.existing = set()
         self.items = []
+        self.post_items = {}
         self.get_calls = []
 
     def observation_exists(self, media_id, slot):
@@ -72,6 +81,17 @@ class MemoryRepository:
             return False
         self.existing.add(key)
         self.items.append(item)
+        return True
+
+    def upsert_post_index(self, item):
+        existing = self.post_items.get((item["PK"], item["SK"]), {})
+        self.post_items[(item["PK"], item["SK"])] = {
+            **existing,
+            **item,
+            "analysis_status": existing.get("analysis_status", "pending"),
+        }
+
+    def save_final_analysis(self, item):
         return True
 
 
@@ -90,14 +110,17 @@ class FakeResponse(BytesIO):
 
 
 class CapturingTable:
-    def __init__(self, existing=False, conditional_failure=False):
+    def __init__(self, existing=False, conditional_failure=False, existing_item=None):
         self.existing = existing
         self.conditional_failure = conditional_failure
+        self.existing_item = existing_item
         self.get_calls = []
         self.put_calls = []
 
     def get_item(self, **kwargs):
         self.get_calls.append(kwargs)
+        if self.existing_item is not None:
+            return {"Item": self.existing_item}
         return {"Item": {"PK": "existing"}} if self.existing else {}
 
     def put_item(self, **kwargs):
@@ -264,8 +287,61 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(result["partial"], 1)
         item = repository.items[0]
         self.assertEqual(item["status"], "PARTIAL")
-        self.assertEqual(item["missing_metrics"], ["reach"])
+        self.assertEqual(item["missing_metrics"], ["reach", "follows"])
         self.assertNotIn("reach", item["metrics"])
+
+    def test_post_index_is_created_for_reel_outside_observation_window(self):
+        client = FakeClient(
+            [{"data": [reel("old", "2026-08-08T12:00:00Z", permalink="https://ig/p/old")]}]
+        )
+        repository = MemoryRepository()
+
+        self.service(client, repository).run(SLOT_EVENT)
+
+        item = next(iter(repository.post_items.values()))
+        self.assertEqual(item["PK"], "ACCOUNT#ig-account")
+        self.assertEqual(item["SK"], "MEDIA#2026-08-08T12:00:00Z#old")
+        self.assertEqual(item["permalink"], "https://ig/p/old")
+        self.assertEqual(item["analysis_due_at"], "2026-09-07T12:00:00Z")
+        self.assertEqual(item["analysis_status"], "pending")
+        self.assertEqual(repository.items, [])
+
+    def test_follows_is_saved_only_when_returned_numerically(self):
+        client = FakeClient(
+            [{"data": [reel("m1")] }],
+            follows_answers={"m1": ({"follows": 3}, [], "trace")},
+        )
+        repository = MemoryRepository()
+
+        self.service(client, repository).run(SLOT_EVENT)
+
+        self.assertEqual(repository.items[0]["metrics"]["follows"], 3)
+        self.assertNotIn("follows", repository.items[0]["missing_metrics"])
+
+    def test_unsupported_follows_keeps_other_insights_and_marks_partial(self):
+        client = FakeClient(
+            [{"data": [reel("m1")] }],
+            failures={"m1": MediaApiError("unsupported")},
+        )
+        # The first call must succeed; model the unsupported follows call only.
+        original_insights = client.insights
+        calls = 0
+
+        def insights(media_id, metrics):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {"views": 10}, [], "trace"
+            raise MediaApiError("unsupported follows")
+
+        client.insights = insights
+        repository = MemoryRepository()
+
+        result = self.service(client, repository).run(SLOT_EVENT)
+
+        self.assertEqual(result["partial"], 1)
+        self.assertEqual(repository.items[0]["metrics"], {"views": 10})
+        self.assertEqual(repository.items[0]["missing_metrics"], ["follows"])
 
     def test_media_api_failure_keeps_scanning_but_fails_lambda_without_error_item(self):
         client = FakeClient(
@@ -445,6 +521,48 @@ class CollectorTests(unittest.TestCase):
         item = {"PK": "MEDIA#m1", "SK": "OBS#" + SLOT}
 
         self.assertFalse(repository.save_observation(item))
+
+    def test_post_index_and_final_analysis_use_conditional_puts_with_distinct_keys(self):
+        table = CapturingTable()
+        repository = DynamoRepository(table)
+        index = post_index_item(
+            reel("m1", permalink="https://ig/p/m1", caption="optional caption"), "ig-account"
+        )
+        final = final_analysis_item(
+            "m1", "2026-10-01", datetime(2026, 10, 1, tzinfo=UTC), {"summary": "ready"}
+        )
+
+        repository.upsert_post_index(index)
+        self.assertTrue(repository.save_final_analysis(final))
+
+        post_put, analysis_put = table.put_calls
+        self.assertEqual(post_put["Item"]["PK"], "ACCOUNT#ig-account")
+        self.assertEqual(post_put["Item"]["SK"], "MEDIA#2026-09-01T12:00:00Z#m1")
+        self.assertEqual(post_put["Item"]["analysis_status"], "pending")
+        self.assertEqual(post_put["Item"]["caption"], "optional caption")
+        self.assertEqual(analysis_put["Item"]["SK"], "ANALYSIS#FINAL#2026-10-01")
+        self.assertEqual(analysis_put["Item"]["PK"], "MEDIA#m1")
+        self.assertEqual(analysis_put["ConditionExpression"], "attribute_not_exists(PK) AND attribute_not_exists(SK)")
+
+    def test_post_index_refresh_does_not_reset_existing_analysis_status(self):
+        existing = {
+            "PK": "ACCOUNT#ig-account",
+            "SK": "MEDIA#2026-09-01T12:00:00Z#m1",
+            "analysis_status": "completed",
+            "caption": "old caption",
+        }
+        table = CapturingTable(existing_item=existing)
+        repository = DynamoRepository(table)
+
+        repository.upsert_post_index(
+            post_index_item(reel("m1", permalink="https://ig/p/m1"), "ig-account")
+        )
+
+        saved = table.put_calls[0]
+        self.assertEqual(saved["Item"]["analysis_status"], "completed")
+        self.assertEqual(saved["Item"]["caption"], "old caption")
+        self.assertIn("attribute_exists(PK)", saved["ConditionExpression"])
+        self.assertEqual(saved["ExpressionAttributeValues"], {":expected_status": "completed"})
 
 
 if __name__ == "__main__":

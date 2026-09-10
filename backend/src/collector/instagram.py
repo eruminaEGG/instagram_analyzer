@@ -21,7 +21,7 @@ class InstagramClient:
 
     def iter_media(self, account_id: str) -> Iterator[dict[str, Any]]:
         path = f"/{self._api_version}/{account_id}/media"
-        params: dict[str, str] | None = {"fields": "id,media_type,media_product_type,timestamp,permalink", "limit": "100"}
+        params: dict[str, str] | None = {"fields": "id,media_type,media_product_type,timestamp,permalink,caption", "limit": "100"}
         while path:
             body, headers = self._request(path, params)
             for media in body.get("data", []):
