@@ -119,6 +119,19 @@ class CollectorTests(unittest.TestCase):
             clock=lambda: datetime(2026, 9, 7, 12, 1, tzinfo=UTC),
         )
 
+    def test_deployed_insight_metric_manifest_excludes_unsupported_media_metrics(self):
+        serverless = (Path(__file__).parents[2] / "serverless.yml").read_text()
+        metric_line = next(
+            line.strip()
+            for line in serverless.splitlines()
+            if line.strip().startswith("INSIGHT_METRICS:")
+        )
+
+        self.assertEqual(
+            metric_line,
+            "INSIGHT_METRICS: views,reach,likes,comments,shares,saved,total_interactions",
+        )
+
     def test_real_client_follows_opaque_paging_next_to_terminal_page(self):
         media_pages = json.loads(
             (Path(__file__).parent / "fixtures" / "media_pages.json").read_text()
