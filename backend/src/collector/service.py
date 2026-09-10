@@ -4,7 +4,13 @@ from datetime import UTC, datetime
 from typing import Any, Callable
 
 from .errors import CollectionFailedError, CollectorError
-from .observability import JsonLogger, safe_api_error_code
+from .observability import (
+    JsonLogger,
+    safe_api_error_code,
+    safe_api_error_message,
+    safe_api_error_type,
+    safe_api_fbtrace_id,
+)
 from .repository import Repository, is_reel, observation_item
 from .timebox import is_collectable, iso, parse_utc, slot_start
 
@@ -80,12 +86,19 @@ class CollectorService:
             except CollectorError as exc:
                 counts["failed"] += 1
                 error_classes[exc.error_class] = error_classes.get(exc.error_class, 0) + 1
+                error_details = {
+                    "api_error_code": safe_api_error_code(exc.api_error_code),
+                    "api_error_subcode": safe_api_error_code(exc.api_error_subcode),
+                    "api_error_message": safe_api_error_message(exc.api_error_message),
+                    "api_error_type": safe_api_error_type(exc.api_error_type),
+                    "api_fbtrace_id": safe_api_fbtrace_id(exc.api_fbtrace_id),
+                }
                 self.logger.emit(
                     "media_collection_failed",
                     slot_start=iso(slot),
                     media_id=media["id"],
                     error_class=exc.error_class,
-                    api_error_code=safe_api_error_code(exc.api_error_code),
+                    **{key: value for key, value in error_details.items() if value is not None},
                 )
 
         summary: dict[str, int | str] = {"slot_start": iso(slot), **counts}

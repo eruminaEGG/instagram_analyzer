@@ -7,9 +7,22 @@ class CollectorError(Exception):
     error_class = "CODE_CONFIG"
     systemic = True
 
-    def __init__(self, message: str, api_error_code: str | None = None):
+    def __init__(
+        self,
+        message: str,
+        api_error_code: str | None = None,
+        *,
+        api_error_message: str | None = None,
+        api_error_type: str | None = None,
+        api_error_subcode: str | None = None,
+        api_fbtrace_id: str | None = None,
+    ):
         super().__init__(message)
         self.api_error_code = api_error_code
+        self.api_error_message = api_error_message
+        self.api_error_type = api_error_type
+        self.api_error_subcode = api_error_subcode
+        self.api_fbtrace_id = api_fbtrace_id
 
 
 class TransientError(CollectorError):

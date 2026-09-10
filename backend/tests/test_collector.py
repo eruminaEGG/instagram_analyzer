@@ -13,7 +13,12 @@ from collector.errors import (
     RateLimitedError,
 )
 from collector.instagram import InstagramClient
-from collector.observability import JsonLogger, redact, safe_api_error_code
+from collector.observability import (
+    JsonLogger,
+    redact,
+    safe_api_error_code,
+    safe_api_error_message,
+)
 from collector.repository import DynamoRepository, observation_item
 from collector.service import CollectorService
 from collector.timebox import iso
@@ -178,6 +183,40 @@ class CollectorTests(unittest.TestCase):
         with self.assertRaises(RateLimitedError):
             InstagramClient("secret", opener=opener, sleep=lambda _: None, max_retries=1).insights("m1", ["views"])
 
+    def test_graph_error_metadata_is_preserved_without_response_body(self):
+        payload = {
+            "error": {
+                "message": "Metric profile_visits is not supported for this media.",
+                "type": "OAuthException",
+                "code": 100,
+                "error_subcode": 33,
+                "fbtrace_id": "AbC_123-test",
+                "access_token": "must-not-be-retained",
+            }
+        }
+
+        def opener(request, timeout):
+            raise HTTPError(
+                request.full_url,
+                400,
+                "bad request",
+                {"x-fb-trace-id": "header-trace"},
+                BytesIO(json.dumps(payload).encode()),
+            )
+
+        with self.assertRaises(MediaApiError) as caught:
+            InstagramClient("secret", opener=opener, sleep=lambda _: None).insights(
+                "m1", ["views", "profile_visits"]
+            )
+
+        error = caught.exception
+        self.assertEqual(error.api_error_code, "100")
+        self.assertEqual(error.api_error_subcode, "33")
+        self.assertEqual(error.api_error_type, "OAuthException")
+        self.assertEqual(error.api_error_message, payload["error"]["message"])
+        self.assertEqual(error.api_fbtrace_id, "AbC_123-test")
+        self.assertFalse(hasattr(error, "access_token"))
+
     def test_exactly_30_days_old_media_is_excluded(self):
         client = FakeClient([{"data": [reel("boundary", "2026-08-08T12:00:00Z")]}])
         repository = MemoryRepository()
@@ -283,6 +322,41 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(failed_collection["failed"], 1)
         self.assertEqual(redact({"access_token": "x", "url": "https://x/?token=y"}), {"access_token": "[REDACTED]", "url": "https://x/?[REDACTED]"})
 
+    def test_structured_logs_include_scrubbed_graph_error_metadata(self):
+        logger = CapturingLogger()
+        client = FakeClient(
+            [{"data": [reel("m1")]}],
+            failures={
+                "m1": MediaApiError(
+                    "generic internal message",
+                    "100",
+                    api_error_message=(
+                        "Unsupported request; access_token=super-secret "
+                        "https://graph.instagram.com/x?access_token=also-secret"
+                    ),
+                    api_error_type="OAuthException",
+                    api_error_subcode="33",
+                    api_fbtrace_id="AbC_123-test",
+                )
+            },
+        )
+
+        with self.assertRaises(CollectionFailedError):
+            self.service(client, MemoryRepository(), JsonLogger(logger)).run(SLOT_EVENT)
+
+        failed_media = next(
+            json.loads(message)
+            for message in logger.messages
+            if json.loads(message)["event"] == "media_collection_failed"
+        )
+        self.assertEqual(failed_media["api_error_code"], "100")
+        self.assertEqual(failed_media["api_error_subcode"], "33")
+        self.assertEqual(failed_media["api_error_type"], "OAuthException")
+        self.assertEqual(failed_media["api_fbtrace_id"], "AbC_123-test")
+        self.assertIn("access_token=[REDACTED]", failed_media["api_error_message"])
+        self.assertNotIn("super-secret", json.dumps(failed_media))
+        self.assertNotIn("also-secret", json.dumps(failed_media))
+
     def test_default_json_logger_enables_info_and_writes_json(self):
         logger = logging.getLogger("instagram_insights_collector")
         previous_level = logger.level
@@ -314,6 +388,23 @@ class CollectorTests(unittest.TestCase):
             redact({"api_error_code": "190 token=super-secret"}),
             {"api_error_code": None},
         )
+        self.assertEqual(
+            safe_api_error_message("Bearer abc access_token=xyz"),
+            "Bearer [REDACTED] access_token=[REDACTED]",
+        )
+
+    def test_api_error_message_redacts_common_credential_assignments(self):
+        dummy_secret = "dummy-sensitive-value"
+
+        for message in (
+            f"Authorization: Bearer {dummy_secret}",
+            f"client_secret={dummy_secret}",
+            f"oauth_token={dummy_secret}",
+        ):
+            with self.subTest(message=message.split("=", 1)[0]):
+                sanitized = safe_api_error_message(message)
+                self.assertNotIn(dummy_secret, sanitized)
+                self.assertIn("[REDACTED]", sanitized)
 
     def test_dynamo_mapper_uses_only_observation_key_and_conditional_put(self):
         table = CapturingTable()

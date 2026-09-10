@@ -58,11 +58,12 @@ class InstagramClient:
                     return json.loads(response.read().decode("utf-8")), {k.lower(): v for k, v in response.headers.items()}
             except HTTPError as exc:
                 payload = self._error_payload(exc)
+                error_fields = self._error_fields(payload, exc)
                 # Meta commonly signals an expired/invalid token as HTTP 401 or error code 190.
                 if exc.code == 401 or str(payload.get("code")) == "190":
                     raise AuthExpiredError(
                         "Instagram authentication failed",
-                        str(payload.get("code", exc.code)),
+                        **error_fields,
                     ) from exc
                 if exc.code == 429:
                     retry_after = exc.headers.get("Retry-After")
@@ -75,12 +76,15 @@ class InstagramClient:
                         continue
                     raise RateLimitedError(
                         "Instagram API rate limited",
-                        str(payload.get("code", exc.code)),
+                        **error_fields,
                     ) from exc
                 if 500 <= exc.code < 600 and attempt < self._max_retries:
                     self._sleep((2**attempt) + random.random())
                     continue
-                raise MediaApiError("Instagram API rejected media request", str(payload.get("code", exc.code))) from exc
+                raise MediaApiError(
+                    "Instagram API rejected media request",
+                    **error_fields,
+                ) from exc
             except (URLError, TimeoutError) as exc:
                 if attempt < self._max_retries:
                     self._sleep((2**attempt) + random.random())
@@ -97,3 +101,19 @@ class InstagramClient:
             return {}
         finally:
             exc.close()
+
+    @staticmethod
+    def _error_fields(payload: dict[str, Any], exc: HTTPError) -> dict[str, str | None]:
+        """Extract only documented Graph error metadata; never retain the body or token."""
+        headers = exc.headers or {}
+        return {
+            "api_error_code": str(payload.get("code", exc.code)),
+            "api_error_message": payload.get("message") if isinstance(payload.get("message"), str) else None,
+            "api_error_type": payload.get("type") if isinstance(payload.get("type"), str) else None,
+            "api_error_subcode": str(payload["error_subcode"]) if payload.get("error_subcode") is not None else None,
+            "api_fbtrace_id": (
+                payload.get("fbtrace_id")
+                if isinstance(payload.get("fbtrace_id"), str)
+                else headers.get("x-fb-trace-id") or headers.get("X-FB-Trace-ID")
+            ),
+        }
